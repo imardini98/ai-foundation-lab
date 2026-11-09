@@ -1,0 +1,56 @@
+{
+  "items": {
+    "I-1000": {"item_no": "I-1000", "description": "Centrifugal pump KP-50", "item_type": "finished_good", "unit": "pcs", "price_eur": 1890.00},
+    "I-2000": {"item_no": "I-2000", "description": "Electric motor 1.5 kW", "item_type": "subassembly", "unit": "pcs", "price_eur": 640.00},
+    "I-2100": {"item_no": "I-2100", "description": "Pump housing, cast iron", "item_type": "subassembly", "unit": "pcs", "price_eur": 310.00},
+    "I-3000": {"item_no": "I-3000", "description": "Drive shaft, stainless steel 20 mm", "item_type": "purchased_part", "unit": "pcs", "price_eur": 48.50},
+    "I-3100": {"item_no": "I-3100", "description": "Ball bearing 6204-2RS", "item_type": "purchased_part", "unit": "pcs", "price_eur": 6.90}
+  },
+  "boms": {
+    "I-1000": [
+      {"item_no": "I-2000", "quantity": 1},
+      {"item_no": "I-2100", "quantity": 1}
+    ],
+    "I-2000": [
+      {"item_no": "I-3000", "quantity": 1},
+      {"item_no": "I-3100", "quantity": 2}
+    ]
+  },
+  "stock": {
+    "I-1000": {"item_no": "I-1000", "location": "FG-01", "on_hand": 4, "reserved": 3},
+    "I-2000": {"item_no": "I-2000", "location": "WIP-02", "on_hand": 2, "reserved": 2},
+    "I-2100": {"item_no": "I-2100", "location": "WIP-03", "on_hand": 7, "reserved": 1},
+    "I-3000": {"item_no": "I-3000", "location": "RM-11", "on_hand": 0, "reserved": 0},
+    "I-3100": {"item_no": "I-3100", "location": "RM-12", "on_hand": 120, "reserved": 16}
+  },
+  "sales_orders": {
+    "SO-7001": {
+      "order_no": "SO-7001", "customer_no": "C-100", "customer_name": "Springfield Municipal Utilities",
+      "order_date": "2026-10-20", "requested_date": "2026-11-28", "delivery_promise": null, "status": "open",
+      "lines": [{"line": 10, "item_no": "I-1000", "quantity": 5}]
+    },
+    "SO-7002": {
+      "order_no": "SO-7002", "customer_no": "C-205", "customer_name": "Huber Agricultural Equipment Ltd.",
+      "order_date": "2026-10-28", "requested_date": "2026-12-05", "delivery_promise": "2026-12-12", "status": "confirmed",
+      "lines": [
+        {"line": 10, "item_no": "I-1000", "quantity": 2},
+        {"line": 20, "item_no": "I-3100", "quantity": 20}
+      ]
+    },
+    "SO-7003": {
+      "order_no": "SO-7003", "customer_no": "C-318", "customer_name": "Keller Machine Works Inc.",
+      "order_date": "2026-11-03", "requested_date": "2026-11-20", "delivery_promise": null, "status": "open",
+      "lines": [{"line": 10, "item_no": "I-2000", "quantity": 3}]
+    }
+  },
+  "production_orders": {
+    "MO-5001": {
+      "order_no": "MO-5001", "item_no": "I-1000", "quantity": 5, "status": "released",
+      "start_date": "2026-11-16", "end_date": "2026-11-25", "sales_order_no": "SO-7001"
+    },
+    "MO-5002": {
+      "order_no": "MO-5002", "item_no": "I-2000", "quantity": 6, "status": "planned",
+      "start_date": "2026-11-12", "end_date": "2026-11-19", "sales_order_no": null
+    }
+  }
+}
