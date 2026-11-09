@@ -51,6 +51,11 @@
       "order_no": "SO-7004", "customer_no": "C-100", "customer_name": "Springfield Municipal Utilities",
       "order_date": "2026-09-15", "requested_date": "2026-10-10", "delivery_promise": "2026-10-08", "status": "delivered",
       "lines": [{"line": 10, "item_no": "I-2100", "quantity": 4}]
+    },
+    "SO-7005": {
+      "order_no": "SO-7005", "customer_no": "C-318", "customer_name": "Keller Machine Works Inc.",
+      "order_date": "2026-10-30", "requested_date": "2026-11-30", "delivery_promise": null, "status": "cancelled",
+      "lines": [{"line": 10, "item_no": "I-3000", "quantity": 10}]
     }
   },
   "production_orders": {

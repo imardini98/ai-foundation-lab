@@ -170,6 +170,38 @@ def test_delivered_order_cannot_be_changed(client):
     assert client.get(url("/sales-orders/SO-7004"), headers=SALES).json()["status"] == "delivered"
 
 
+def test_cancelled_order_cannot_be_confirmed(client):
+    r = patch(client, SALES, "2026-12-01", "k", order="SO-7005")
+    assert r.status_code == 409
+    assert "cancelled" in r.json()["detail"]
+
+
+def test_confirmed_order_can_be_rescheduled(client):
+    assert patch(client, SALES, "2026-12-01", "k1").status_code == 200
+    r = patch(client, SALES, "2026-12-15", "k2")
+    assert r.status_code == 200
+    assert r.json()["delivery_promise"] == "2026-12-15"
+
+
+def test_transition_table_covers_every_status():
+    from typing import get_args
+
+    from fake_erp.main import SALES_ORDER_TRANSITIONS, SalesOrderStatus
+
+    statuses = set(get_args(SalesOrderStatus))
+    assert set(SALES_ORDER_TRANSITIONS) == statuses
+    assert all(targets <= statuses for targets in SALES_ORDER_TRANSITIONS.values())
+
+
+def test_today_uses_company_time_zone(client, clock):
+    # 2026-11-08 23:30 UTC is already 2026-11-09 00:30 in Hamburg (CET, UTC+1).
+    clock.t = datetime(2026, 11, 8, 23, 30, tzinfo=timezone.utc)
+    r = patch(client, SALES, "2026-11-08", "k")
+    assert r.status_code == 422
+    assert "past" in r.json()["detail"]
+    assert patch(client, SALES, "2026-11-09", "k2").status_code == 200
+
+
 def test_patch_rejects_unknown_fields(client):
     r = client.patch(PATCH, json={"delivery_promise": "2026-12-01", "status": "delivered"},
                      headers={**SALES, "Idempotency-Key": "x"})
@@ -247,6 +279,34 @@ def test_rejected_writes_are_not_audited(app, client):
     patch(client, SALES, "2026-12-01", "k2", "SO-7004")  # delivered
     patch(client, WH, "2026-12-01", "k3")              # forbidden
     assert app.state.audit_log == []
+
+
+# ---------------------------------------------------------------- security log
+
+def test_forbidden_write_goes_to_security_log_not_audit(app, client):
+    patch(client, WH, "2026-12-01", "k")
+    assert app.state.audit_log == []
+    (entry,) = app.state.security_log
+    assert entry["event"] == "access_denied"
+    assert entry["user_id"] == "bob"
+    assert entry["known_user"] is True
+    assert entry["role"] == "warehouse"
+    assert entry["method"] == "PATCH"
+    assert entry["operation_id"] == "set_delivery_promise"
+    assert entry["required_permission"] == "sales_order:delivery_promise"
+
+
+def test_unknown_user_is_logged_and_header_truncated(app, client):
+    client.get(url("/items/I-1000"), headers={"X-User": "x" * 500})
+    client.get(url("/items/I-1000"))
+    first, second = app.state.security_log
+    assert first["known_user"] is False and len(first["user_id"]) == 64
+    assert second["user_id"] is None
+
+
+def test_allowed_requests_are_not_security_logged(app, client):
+    client.get(url("/items/I-1000"), headers=SALES)
+    assert app.state.security_log == []
 
 
 # ---------------------------------------------------------------- contract

@@ -8,6 +8,8 @@ Security model (deny by default):
     OAuth token's claims). Missing or unknown user -> 403.
   * The user's role must hold the route's permission, otherwise -> 403.
   * Every write appends an audit entry (who, role, what, before/after).
+  * Every 403 appends a security entry (separate from the business audit).
+  * Business dates ("today") are evaluated in the company time zone.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Callable, Literal
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path as PathParam, Query, Request
 from fastapi.responses import JSONResponse
@@ -30,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 DATA_FILE = Path(__file__).with_name("data.json")
 API_PREFIX = "/api/web/v1"
+COMPANY_TZ = ZoneInfo("Europe/Berlin")
 
 # Idempotency store limits. In-memory is fine for the lab.
 # TODO(prod): persist in the database (unique index on user_id+operation+key) with a TTL job.
@@ -37,6 +41,21 @@ IDEMPOTENCY_TTL = timedelta(hours=24)
 IDEMPOTENCY_MAX_ENTRIES = 10_000
 
 audit_logger = logging.getLogger("fake_erp.audit")
+security_logger = logging.getLogger("fake_erp.security")
+
+
+# --------------------------------------------------------------------------- sales order states
+
+SalesOrderStatus = Literal["open", "confirmed", "delivered", "cancelled"]
+
+# Allowed status transitions. Anything not listed is rejected with 409.
+# confirmed -> confirmed is a reschedule of an existing delivery promise.
+SALES_ORDER_TRANSITIONS: dict[str, frozenset[str]] = {
+    "open": frozenset({"confirmed", "cancelled"}),
+    "confirmed": frozenset({"confirmed", "delivered", "cancelled"}),
+    "delivered": frozenset(),
+    "cancelled": frozenset(),
+}
 
 
 # --------------------------------------------------------------------------- identity & roles
@@ -82,18 +101,36 @@ def authorize(
 ) -> Principal:
     route = request.scope.get("route")
     required = (getattr(route, "openapi_extra", None) or {}).get("x-permission")
+    user = request.app.state.users.get(x_user) if x_user else None
+
+    def deny(reason: str, role: str | None = None):
+        entry = {
+            "at": request.app.state.now().isoformat(),
+            "event": "access_denied",
+            "user_id": (x_user or "")[:64] or None,  # raw header value, truncated: it is untrusted
+            "known_user": user is not None,
+            "role": role,
+            "method": request.method,
+            "path": request.url.path,
+            "operation_id": getattr(route, "operation_id", None),
+            "required_permission": required,
+            "reason": reason,
+        }
+        request.app.state.security_log.append(entry)
+        security_logger.warning(json.dumps(entry))
+        raise HTTPException(403, reason)
+
     if not required:
         # Deny by default: a route that forgot to declare a permission is closed.
-        raise HTTPException(403, "Route declares no permission")
-    user = request.app.state.users.get(x_user) if x_user else None
+        deny("Route declares no permission")
     if user is None:
-        raise HTTPException(403, "Missing or unknown user in X-User")
+        deny("Missing or unknown user in X-User")
     try:
         role = Role(user["role"])
     except ValueError:
-        raise HTTPException(403, "User has no valid role")
+        deny("User has no valid role")
     if required not in ROLE_PERMISSIONS[role]:
-        raise HTTPException(403, f"Role '{role.value}' lacks permission '{required}'")
+        deny(f"Role '{role.value}' lacks permission '{required}'", role=role.value)
     return Principal(user_id=user["user_id"], role=role)
 
 
@@ -149,7 +186,7 @@ class SalesOrder(BaseModel):
     order_date: date
     requested_date: date
     delivery_promise: date | None
-    status: Literal["open", "confirmed", "delivered"]
+    status: SalesOrderStatus
     lines: list[SalesOrderLine]
 
 
@@ -199,7 +236,9 @@ def create_app(
         ),
     )
     app.state.users = db["users"]
+    app.state.now = now
     app.state.audit_log = []  # TODO(prod): append-only table, not process memory.
+    app.state.security_log = []  # TODO(prod): ship to the SIEM / observability stack.
     api = APIRouter(prefix=API_PREFIX, dependencies=[Depends(authorize)], responses=ERR_403)
 
     def get_or_404(table: str, key: str, label: str) -> dict:
@@ -288,15 +327,16 @@ def create_app(
         openapi_extra=perm("sales_order:delivery_promise"),
         responses={
             **ERR_404,
-            409: {"model": Error, "description": "Order is already delivered"},
+            409: {"model": Error, "description": "Order status does not allow this change (delivered or cancelled)"},
             422: {"description": "Invalid input, date in the past or before the order date, "
                                  "or Idempotency-Key reused with a different request"},
         },
         summary="Set the delivery promise of a sales order (idempotent)",
         description=(
             "Sets the promised delivery date and moves the status to `confirmed`.\n\n"
-            "Rules: the date must be today or later and not before `order_date`; "
-            "a `delivered` order cannot be changed (409).\n\n"
+            "Rules: the date must be today or later (company time zone Europe/Berlin) and not before "
+            "`order_date`. The status transition must be allowed: `open` and `confirmed` (reschedule) can be "
+            "confirmed; `delivered` and `cancelled` cannot (409).\n\n"
             "`Idempotency-Key` is required and scoped per user and operation. The same user sending the same key "
             "with the same request gets the stored response (header `Idempotent-Replayed: true`) without the change "
             "being applied again; the same key with a different request returns 422. Keys expire after 24 h.\n\n"
@@ -326,9 +366,10 @@ def create_app(
                                     headers={"Idempotent-Replayed": "true"})
 
             order = get_or_404("sales_orders", order_no, "Sales order")
-            if order["status"] == "delivered":
-                raise HTTPException(409, f"Sales order '{order_no}' is already delivered")
-            if body.delivery_promise < current.date():
+            if "confirmed" not in SALES_ORDER_TRANSITIONS[order["status"]]:
+                raise HTTPException(
+                    409, f"Sales order '{order_no}' is {order['status']} and cannot be confirmed")
+            if body.delivery_promise < current.astimezone(COMPANY_TZ).date():
                 raise HTTPException(422, "delivery_promise must not be in the past")
             if body.delivery_promise < date.fromisoformat(order["order_date"]):
                 raise HTTPException(422, "delivery_promise must not be before the order date")

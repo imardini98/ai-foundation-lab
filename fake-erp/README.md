@@ -50,13 +50,28 @@ Header `X-User: <user_id>`. The client sends **who** it is, never its role: the 
 
 Every successful write appends an entry with timestamp, `user_id`, role, action, resource, before/after values and the idempotency key. Entries go to `app.state.audit_log` and to the `fake_erp.audit` logger. Rejected writes and idempotent replays are not logged.
 
+### Security log
+
+Every 403 is written to a separate security log (`app.state.security_log` and the `fake_erp.security` logger, level WARNING), never to the business audit. Each entry has timestamp, the raw `X-User` value (truncated to 64 chars, since it's untrusted), whether it's a known user, role, method, path, `operation_id`, required permission and reason. This is the signal to watch in observability: an agent trying to write without permission shows up here.
+
 ## PATCH delivery promise
 
 **Business rules**
-- The date must be today or later → otherwise 422.
+- The date must be today or later → otherwise 422. "Today" is the company's date in `Europe/Berlin`, not UTC.
 - The date must not be before `order_date` → otherwise 422.
-- A `delivered` order can't be changed → 409.
+- The status transition must be allowed (see below) → otherwise 409.
 - On success, `status` becomes `confirmed`.
+
+**Status transitions** (`SALES_ORDER_TRANSITIONS`)
+
+| From | Allowed to |
+|---|---|
+| `open` | `confirmed`, `cancelled` |
+| `confirmed` | `confirmed` (reschedule), `delivered`, `cancelled` |
+| `delivered` | — |
+| `cancelled` | — |
+
+Only the → `confirmed` transitions are exposed through the API today; there are no endpoints yet for delivering or cancelling.
 
 **Idempotency**
 - `Idempotency-Key` is required (422 if it's missing).
@@ -68,9 +83,10 @@ Every successful write appends an entry with timestamp, `user_id`, role, action,
 ## Known gaps (TODO)
 
 - **No stock reservation.** Confirming a delivery promise doesn't touch `reserved` or check availability, so two orders can be promised against the same stock.
-- **Idempotency store and audit log live in memory.** In production they belong in the database: an idempotency table with a unique index on (user, operation, key) and a TTL job, plus an append-only audit table.
+- **Reschedules are unlimited.** A `confirmed` order can be re-confirmed any number of times; each change is audited, but there's no cap or approval step.
+- **Idempotency store, audit log and security log live in memory.** In production they belong in the database: an idempotency table with a unique index on (user, operation, key) and a TTL job, plus an append-only audit table.
 - **`X-User` is trusted as-is.** It's a stand-in for OAuth (planned for S2), where the user id and role come from a verified token.
 
 ## Data
 
-`fake_erp/data.json` is loaded into memory at startup: 3 users, 5 items, a 2-level BOM (I-1000 → I-2000 → I-3000/I-3100), 4 sales orders (one already delivered), 2 production orders.
+`fake_erp/data.json` is loaded into memory at startup: 3 users, 5 items, a 2-level BOM (I-1000 → I-2000 → I-3000/I-3100), 5 sales orders (one delivered, one cancelled), 2 production orders.

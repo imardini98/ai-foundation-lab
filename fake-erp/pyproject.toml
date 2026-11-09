@@ -5,6 +5,7 @@ description = "Fake ERP REST API (Proalpha-like) for MCP experiments"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
+    "tzdata>=2026.6",
     "uvicorn>=0.30",
 ]
 
