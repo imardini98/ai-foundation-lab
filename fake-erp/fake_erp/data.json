@@ -1,4 +1,9 @@
 {
+  "users": {
+    "alice": {"user_id": "alice", "name": "Alice Becker", "role": "sales"},
+    "carol": {"user_id": "carol", "name": "Carol Diaz", "role": "sales"},
+    "bob": {"user_id": "bob", "name": "Bob Fischer", "role": "warehouse"}
+  },
   "items": {
     "I-1000": {"item_no": "I-1000", "description": "Centrifugal pump KP-50", "item_type": "finished_good", "unit": "pcs", "price_eur": 1890.00},
     "I-2000": {"item_no": "I-2000", "description": "Electric motor 1.5 kW", "item_type": "subassembly", "unit": "pcs", "price_eur": 640.00},
@@ -41,6 +46,11 @@
       "order_no": "SO-7003", "customer_no": "C-318", "customer_name": "Keller Machine Works Inc.",
       "order_date": "2026-11-03", "requested_date": "2026-11-20", "delivery_promise": null, "status": "open",
       "lines": [{"line": 10, "item_no": "I-2000", "quantity": 3}]
+    },
+    "SO-7004": {
+      "order_no": "SO-7004", "customer_no": "C-100", "customer_name": "Springfield Municipal Utilities",
+      "order_date": "2026-09-15", "requested_date": "2026-10-10", "delivery_promise": "2026-10-08", "status": "delivered",
+      "lines": [{"line": 10, "item_no": "I-2100", "quantity": 4}]
     }
   },
   "production_orders": {

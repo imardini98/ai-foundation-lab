@@ -3,8 +3,11 @@
 Security model (deny by default):
   * Every route under /api must declare `x-permission` in its openapi_extra.
     A route without it is rejected with 403 for everybody.
-  * The caller sends `X-User: <role>`. Missing or unknown role -> 403.
-    The role must hold the route's permission, otherwise -> 403.
+  * The caller sends `X-User: <user_id>`. The role is NOT taken from the client:
+    it is looked up server-side in the user directory (today data.json, later the
+    OAuth token's claims). Missing or unknown user -> 403.
+  * The user's role must hold the route's permission, otherwise -> 403.
+  * Every write appends an audit entry (who, role, what, before/after).
 """
 
 from __future__ import annotations
@@ -12,11 +15,14 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import threading
-from datetime import date
+from collections import OrderedDict
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Callable, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path as PathParam, Query, Request
 from fastapi.responses import JSONResponse
@@ -25,8 +31,15 @@ from pydantic import BaseModel, ConfigDict, Field
 DATA_FILE = Path(__file__).with_name("data.json")
 API_PREFIX = "/api/web/v1"
 
+# Idempotency store limits. In-memory is fine for the lab.
+# TODO(prod): persist in the database (unique index on user_id+operation+key) with a TTL job.
+IDEMPOTENCY_TTL = timedelta(hours=24)
+IDEMPOTENCY_MAX_ENTRIES = 10_000
 
-# --------------------------------------------------------------------------- roles
+audit_logger = logging.getLogger("fake_erp.audit")
+
+
+# --------------------------------------------------------------------------- identity & roles
 
 class Role(str, Enum):
     sales = "sales"
@@ -49,6 +62,12 @@ ROLE_PERMISSIONS: dict[Role, frozenset[str]] = {
 }
 
 
+@dataclass(frozen=True)
+class Principal:
+    user_id: str
+    role: Role
+
+
 def perm(name: str) -> dict:
     """openapi_extra marker: the permission a route requires (also visible in the OpenAPI contract)."""
     return {"x-permission": name}
@@ -58,23 +77,27 @@ def authorize(
     request: Request,
     x_user: Annotated[
         str | None,
-        Header(description="Caller role: `sales` or `warehouse`."),
+        Header(description="Caller's user id (e.g. `alice`). The role is resolved server-side."),
     ] = None,
-) -> Role:
+) -> Principal:
     route = request.scope.get("route")
     required = (getattr(route, "openapi_extra", None) or {}).get("x-permission")
     if not required:
         # Deny by default: a route that forgot to declare a permission is closed.
         raise HTTPException(403, "Route declares no permission")
+    user = request.app.state.users.get(x_user) if x_user else None
+    if user is None:
+        raise HTTPException(403, "Missing or unknown user in X-User")
     try:
-        role = Role(x_user) if x_user else None
+        role = Role(user["role"])
     except ValueError:
-        role = None
-    if role is None:
-        raise HTTPException(403, "Missing or unknown role in X-User")
+        raise HTTPException(403, "User has no valid role")
     if required not in ROLE_PERMISSIONS[role]:
         raise HTTPException(403, f"Role '{role.value}' lacks permission '{required}'")
-    return role
+    return Principal(user_id=user["user_id"], role=role)
+
+
+CurrentPrincipal = Annotated[Principal, Depends(authorize)]
 
 
 # --------------------------------------------------------------------------- models
@@ -132,7 +155,10 @@ class SalesOrder(BaseModel):
 
 class DeliveryPromiseUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    delivery_promise: date = Field(description="Promised delivery date (ISO date)", examples=["2026-12-01"])
+    delivery_promise: date = Field(
+        description="Promised delivery date (ISO date). Must be today or later and not before the order date.",
+        examples=["2026-12-01"],
+    )
 
 
 class ProductionOrder(BaseModel):
@@ -145,7 +171,7 @@ class ProductionOrder(BaseModel):
     sales_order_no: str | None
 
 
-ERR_403 = {403: {"model": Error, "description": "Missing or insufficient role"}}
+ERR_403 = {403: {"model": Error, "description": "Missing user or insufficient permission"}}
 ERR_404 = {404: {"model": Error, "description": "Not found"}}
 
 ItemNo = Annotated[str, PathParam(description="Item number, e.g. I-1000")]
@@ -154,19 +180,26 @@ SalesOrderNo = Annotated[str, PathParam(description="Sales order number, e.g. SO
 
 # --------------------------------------------------------------------------- app
 
-def create_app(data_file: Path = DATA_FILE) -> FastAPI:
+def create_app(
+    data_file: Path = DATA_FILE,
+    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> FastAPI:
     db = copy.deepcopy(json.loads(data_file.read_text(encoding="utf-8")))
-    idempotency_store: dict[str, dict] = {}
+    # key: (user_id, operation_id, idempotency_key) -> {fingerprint, status, body, created_at}
+    idempotency_store: OrderedDict[tuple[str, str, str], dict] = OrderedDict()
     lock = threading.Lock()
 
     app = FastAPI(
         title="Fake ERP",
-        version="0.1.0",
+        version="0.2.0",
         description=(
             "Fake ERP REST API (Proalpha/PASOE-like) used as a backend for MCP experiments. "
-            "Authentication via the `X-User` header (role). Anything not explicitly allowed is rejected with 403."
+            "Authentication via the `X-User` header (user id; role resolved server-side). "
+            "Anything not explicitly allowed is rejected with 403."
         ),
     )
+    app.state.users = db["users"]
+    app.state.audit_log = []  # TODO(prod): append-only table, not process memory.
     api = APIRouter(prefix=API_PREFIX, dependencies=[Depends(authorize)], responses=ERR_403)
 
     def get_or_404(table: str, key: str, label: str) -> dict:
@@ -174,6 +207,27 @@ def create_app(data_file: Path = DATA_FILE) -> FastAPI:
         if row is None:
             raise HTTPException(404, f"{label} '{key}' not found")
         return row
+
+    def audit(principal: Principal, action: str, resource: str, before: dict, after: dict, idempotency_key: str):
+        entry = {
+            "at": now().isoformat(),
+            "user_id": principal.user_id,
+            "role": principal.role.value,
+            "action": action,
+            "resource": resource,
+            "before": before,
+            "after": after,
+            "idempotency_key": idempotency_key,
+        }
+        app.state.audit_log.append(entry)
+        audit_logger.info(json.dumps(entry))
+
+    def purge_expired_idempotency(current: datetime):
+        while idempotency_store:
+            _, oldest = next(iter(idempotency_store.items()))
+            if current - oldest["created_at"] < IDEMPOTENCY_TTL and len(idempotency_store) < IDEMPOTENCY_MAX_ENTRIES:
+                break
+            idempotency_store.popitem(last=False)
 
     # ---- Items
     @api.get("/items", response_model=list[Item], operation_id="search_items",
@@ -232,26 +286,39 @@ def create_app(data_file: Path = DATA_FILE) -> FastAPI:
         "/sales-orders/{order_no}/delivery-promise", response_model=SalesOrder,
         operation_id="set_delivery_promise", tags=["Sales orders"],
         openapi_extra=perm("sales_order:delivery_promise"),
-        responses={**ERR_404, 422: {"description": "Invalid input, or Idempotency-Key reused with a different request"}},
+        responses={
+            **ERR_404,
+            409: {"model": Error, "description": "Order is already delivered"},
+            422: {"description": "Invalid input, date in the past or before the order date, "
+                                 "or Idempotency-Key reused with a different request"},
+        },
         summary="Set the delivery promise of a sales order (idempotent)",
         description=(
-            "Sets the promised delivery date and moves the status to `confirmed`. "
-            "`Idempotency-Key` is required. The same key with the same request returns the stored response "
-            "(header `Idempotent-Replayed: true`) without applying the change again; "
-            "the same key with a different request returns 422."
+            "Sets the promised delivery date and moves the status to `confirmed`.\n\n"
+            "Rules: the date must be today or later and not before `order_date`; "
+            "a `delivered` order cannot be changed (409).\n\n"
+            "`Idempotency-Key` is required and scoped per user and operation. The same user sending the same key "
+            "with the same request gets the stored response (header `Idempotent-Replayed: true`) without the change "
+            "being applied again; the same key with a different request returns 422. Keys expire after 24 h.\n\n"
+            "Does not reserve stock yet."
         ),
     )
     def set_delivery_promise(
         order_no: SalesOrderNo,
         body: DeliveryPromiseUpdate,
+        principal: CurrentPrincipal,
         idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255,
                                                description="Unique key per business change, e.g. a UUID")],
     ):
+        operation = "set_delivery_promise"
+        store_key = (principal.user_id, operation, idempotency_key)
         fingerprint = hashlib.sha256(
             json.dumps({"order_no": order_no, "body": body.model_dump(mode="json")}, sort_keys=True).encode()
         ).hexdigest()
+        current = now()
         with lock:
-            stored = idempotency_store.get(idempotency_key)
+            purge_expired_idempotency(current)
+            stored = idempotency_store.get(store_key)
             if stored is not None:
                 if stored["fingerprint"] != fingerprint:
                     raise HTTPException(422, "Idempotency-Key was already used for a different request")
@@ -259,10 +326,25 @@ def create_app(data_file: Path = DATA_FILE) -> FastAPI:
                                     headers={"Idempotent-Replayed": "true"})
 
             order = get_or_404("sales_orders", order_no, "Sales order")
+            if order["status"] == "delivered":
+                raise HTTPException(409, f"Sales order '{order_no}' is already delivered")
+            if body.delivery_promise < current.date():
+                raise HTTPException(422, "delivery_promise must not be in the past")
+            if body.delivery_promise < date.fromisoformat(order["order_date"]):
+                raise HTTPException(422, "delivery_promise must not be before the order date")
+
+            # TODO: confirming a date should reserve stock (or check ATP) for each order line.
+            # Without it, two orders can be promised against the same available quantity.
+
+            before = {"delivery_promise": order["delivery_promise"], "status": order["status"]}
             order["delivery_promise"] = body.delivery_promise.isoformat()
             order["status"] = "confirmed"
+            after = {"delivery_promise": order["delivery_promise"], "status": order["status"]}
+            audit(principal, operation, f"sales_order:{order_no}", before, after, idempotency_key)
+
             result = SalesOrder.model_validate(order).model_dump(mode="json")
-            idempotency_store[idempotency_key] = {"fingerprint": fingerprint, "status": 200, "body": result}
+            idempotency_store[store_key] = {"fingerprint": fingerprint, "status": 200, "body": result,
+                                            "created_at": current}
             return JSONResponse(result, status_code=200)
 
     # ---- Production orders
